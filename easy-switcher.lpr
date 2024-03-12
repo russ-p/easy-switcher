@@ -11,7 +11,9 @@ uses
   Classes,
   IniFiles,
   EventLog,
-  Errors;
+  Errors,
+  SyncObjs,
+  Generics.Collections;
 
 type
   input_event = record   //c-style struct input_event
@@ -45,6 +47,8 @@ type
   TEmitBuf = array [1..2] of input_event;
   TBufferAction = (KeepBuffer, ReplaceAll, ReplaceWord);
   TQueueSelector = (TCIFLUSH, TCOFLUSH, TCIOFLUSH);
+
+  TInputEventsQueue = specialize TQueue<input_event>;
 
 const
   EASY_SWITCHER_VERSION = '0.3';
@@ -140,6 +144,9 @@ var
   BufferAction: TBufferAction = KeepBuffer;
 
   StopAndExit: boolean = False;
+
+  IEQCriticalSection: TCriticalSection;
+  InputEventsQueue : TInputEventsQueue;
 
   procedure Log(EventType: TEventType; aMessage: string; StdOutputOnly: boolean);
   begin
@@ -582,12 +589,68 @@ var
     Result := 0;
   end;
 
+  function TrackKeyboardThread(ptr: pointer): ptrint;
+  var
+    KeyboardPath: string = '';
+    KeyboardFD: longint = -1;
+    KeyIE: input_event;
+    ioRes: int64 = -1;
+    EmitEvent: input_event;
+  begin
+    KeyboardPath := String(ptr^);
+    KeyboardFD := fpOpen(KeyboardPath, O_RDONLY or O_SYNC);
+    if KeyboardFD = -1 then
+    begin
+      Log(etError, Format('Cannot open %s %s', [KeyboardPath, StrError(errno)]), False);
+      Halt(1);
+    end;
+
+    Log(etInfo, Format('Run reading thread %s', [KeyboardPath]), True);
+    while not StopAndExit do
+    begin
+      ioRes := fpRead(KeyboardFD, KeyIE, SizeOf(KeyIE));
+      if (ioRes <> SizeOf(KeyIE)) then
+        begin
+          if (errno = EINTR) then
+            Continue
+          else
+          begin
+            errno := EIO;
+            Log(etError, Format('Abnormal data read from %s %s',
+              [KeyboardPath, StrError(errno)]), False);
+            Continue;
+          end;
+        end
+      else
+        begin
+          Log(etInfo, Format('Key %d captured', [KeyIE.code]), True);
+          if (not Assigned(IEQCriticalSection) or not Assigned(InputEventsQueue)) then
+          begin
+            Continue;
+          end;
+          // Sync
+          IEQCriticalSection.Enter;
+          try
+            EmitEvent := Default(input_event);
+            EmitEvent := KeyIE;
+            InputEventsQueue.Enqueue(KeyIE);
+          finally
+            IEQCriticalSection.Leave;
+          end;
+        end;
+    end;
+    if KeyboardFD <> -1 then fpClose(KeyboardFD);
+    Log(etInfo, Format('Done thread %s', [KeyboardPath]), True);
+    Result := 0;
+  end;
+
   procedure Run();
   var
     i: integer = 0;
     NewAct, OldAct: SigactionRec;
     ConfigIniFile: TIniFile = nil;
     KeyboardPath: string = '';
+    KeyboardPath2: string = '/dev/input/event21'; //TODO: config
     MousePath: string = '';
     ReverseMode: boolean = False;
     Delay: integer = 10;
@@ -976,14 +1039,21 @@ var
     end;
     Log(etInfo, 'Done.', True);
 
+    IEQCriticalSection := TCriticalSection.Create;
+    InputEventsQueue := TInputEventsQueue.Create;
+
     //start keyboard reading
     Log(etInfo, 'Opening keyboard...', True);
-    KeyboardFD := fpOpen(KeyboardPath, O_RDONLY or O_SYNC);
-    if KeyboardFD = -1 then
-    begin
-      Log(etError, Format('Cannot open %s %s', [KeyboardPath, StrError(errno)]), False);
-      Halt(1);
-    end;
+
+    BeginThread(@TrackKeyboardThread, @KeyboardPath);
+    BeginThread(@TrackKeyboardThread, @KeyboardPath2);
+
+    // KeyboardFD := fpOpen(KeyboardPath, O_RDONLY or O_SYNC);
+    // if KeyboardFD = -1 then
+    // begin
+    //   Log(etError, Format('Cannot open %s %s', [KeyboardPath, StrError(errno)]), False);
+    //   Halt(1);
+    // end;
     Log(etInfo, 'Done.', True);
 
     //install virtual keyboard
@@ -1025,8 +1095,10 @@ var
     Log(etInfo, 'Easy Switcher started successfully.', False);
     while not StopAndExit do
     begin
-      ioRes := fpRead(KeyboardFD, KeyIE, SizeOf(KeyIE));
-      if (ioRes <> SizeOf(KeyIE)) then
+      // ioRes := fpRead(KeyboardFD, KeyIE, SizeOf(KeyIE));
+      // if (ioRes <> SizeOf(KeyIE)) then
+      // -= usused section here =-
+      if (ioRes <> -1) then
       begin
         if (errno = EINTR) then
           Continue
@@ -1046,6 +1118,19 @@ var
           NeedClearKeyBuf := False;
           Log(etInfo, 'buffer cleared', True);
         end;
+
+        sleep(5);
+        IEQCriticalSection.Enter;
+         try
+          if InputEventsQueue.Count = 0 then
+          begin
+            Continue;
+          end;
+          KeyIE := InputEventsQueue.Dequeue;
+        finally
+          IEQCriticalSection.Leave;
+        end;
+
         if ((KeyIE.ie_type = EV_KEY) and (KeyIE.Value in [0, 1])) then //, 2
         begin
           Log(etInfo, Format('input %s %s', [KeyName[KeyIE.code],
@@ -1098,6 +1183,9 @@ var
         end;
       end;
     end;
+
+    FreeAndNil(IEQCriticalSection);
+    FreeAndNil(InputEventsQueue);
 
     if KeyboardFD <> -1 then fpClose(KeyboardFD);
     if MouseFD <> -1 then fpClose(MouseFD);
